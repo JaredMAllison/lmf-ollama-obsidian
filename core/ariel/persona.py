@@ -197,42 +197,48 @@ class ArielOrchestrator(Orchestrator):
 
         # === 2. Think (internal monologue) ===
         thinking_prompt = f"""You are Ariel's internal reasoning module.
-Analyze the user's message and identify what knowledge is missing to provide a grounded, neuro‑informed response.
-If you need to look up information in the vault, specify the tool calls you would make using these exact tool names:
+Determine what the user wants: READ (find information), or WRITE (create, edit, update content).
 
-  search_vault("query", "top_k")     — full-text search across vault notes
-  read_section("path", "heading")    — read a named section from a specific file
-  read_lines("path", start, end)     — read a line range from a file
-  outline("path")                    — get heading structure of a file
-  grep_vault("pattern")              — regex search across all files
-  list_files()                       — list all vault notes
+If the user asks to create, edit, update, update documentation, capture, save, add, or change content:
+  — You MUST propose write tool calls. Search the vault first with read tools if you need context.
+  — Available write tools:
+      create_file("path", "content")
+      append_to_file("path", "content")
+      replace_lines("path", start_line, end_line, "new_content")
+      insert_after_heading("path", "heading", "content")
 
-If the user asks to create, edit, update, capture, or change content, propose write tool calls:
-
-  create_file("path", "content")               — create a new file at the given path
-  append_to_file("path", "content")            — append content to an existing file
-  replace_lines("path", start, end, "content") — replace a range of lines in a file
-  insert_after_heading("path", "heading", "content") — insert content after a named heading
+If the user asks to find or retrieve information, use read tools:
+  — Available read tools:
+      search_vault("query", "top_k")
+      read_section("path", "heading")
+      read_lines("path", start, end)
+      outline("path")
+      grep_vault("pattern")
+      list_files()
 
 The vault also contains:
 - System/Skills/ — workflow definitions for common tasks
 - Learning/ — architecture patterns and coded principles
 - Insights/ — design philosophy and self-knowledge
+If relevant, search_vault or grep_vault to check them.
 
-If relevant to the user's request, use search_vault or grep_vault to check them.
+Output one or more Tool: lines for every action needed.
+FIRST read tools for context, THEN write tools for the update.
+Do NOT skip write tools — if the user asked to update content, you MUST output a write tool.
+Do NOT output "No external lookup needed" — always reason and propose tools.
 
-Output your reasoning in this format:
-
-Thought: [your reasoning about what information is needed]
-Tool: tool_name("arguments")
-(You can specify multiple Tool lines if needed.)
-
-If no external knowledge is needed, just output:
-Thought: No external lookup needed.
+Format:
+Thought: [reasoning]
+Tool: read_tool("args")
+Tool: write_tool("args")
 
 User message: {sanitized_input}"""
         thinking_response = self._call_backend(thinking_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
         thought, tool_calls = self.thinker.extract_thoughts_and_tools(thinking_response)
+        if tool_calls:
+            logging.info(f"[Ariel] Think proposed {len(tool_calls)} tool(s): {[tc['name'] for tc in tool_calls]}")
+        else:
+            logging.info(f"[Ariel] Think proposed no tools. Thought: {thought[:120] if thought else 'None'}")
 
         # === 3. Separate read vs write tool calls ===
         read_calls = []
