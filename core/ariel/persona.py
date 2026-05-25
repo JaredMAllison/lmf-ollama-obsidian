@@ -201,8 +201,8 @@ Determine what the user wants: READ (find information), or WRITE (create, update
 
 If the user asks to create, update, edit, update documentation, capture, save, add, or change content:
   — You MUST propose write tool calls.
-  — FIRST read the target file with read_section or read_lines to see its current content.
-  — THEN propose the write tool to make the change.
+  — Always output a read tool FIRST to get the file's current content.
+  — Then output the write tool with the exact path from the read result.
   — Always use full filenames with .md extension for vault files.
   — For files with frontmatter (YAML between --- markers), use replace_lines to update specific lines.
   — For adding content below a heading, use insert_after_heading.
@@ -213,6 +213,11 @@ If the user asks to create, update, edit, update documentation, capture, save, a
       append_to_file("path.md", "content")
       replace_lines("path.md", start_line, end_line, "new_content")
       insert_after_heading("path.md", "heading", "content")
+
+Example — user says "update reschedule-dental-appointment.md with Aug 3":
+  Thought: I need to read the task file first to see current content, then update the date.
+  Tool: read_lines("Tasks/reschedule-dental-appointment.md", 1, 30)
+  Tool: replace_lines("Tasks/reschedule-dental-appointment.md", 3, 5, "goal_date: 2026-08-03")
 
 If the user asks to find or retrieve information, use read tools:
   — Available read tools:
@@ -229,9 +234,9 @@ The vault also contains:
 - Insights/ — design philosophy and self-knowledge
 If relevant, search_vault or grep_vault to check them.
 
-Output Tool: lines for every action needed. Put read tools first (to get context), then write tools (to make the change).
-Do NOT skip write tools — if the user asked to update content, you MUST output a write tool.
-Do NOT output "No external lookup needed" — always reason and propose.
+Always output Tool: lines for every action. Read first (to get context), then write (to make the change).
+Do NOT skip write tools. Do NOT use placeholder paths like "path.md".
+Do NOT output "No external lookup needed".
 
 Format:
 Thought: [reasoning]
@@ -241,10 +246,11 @@ Tool: write_tool("args")
 User message: {sanitized_input}"""
         thinking_response = self._call_backend(thinking_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
         thought, tool_calls = self.thinker.extract_thoughts_and_tools(thinking_response)
+        logging.warning(f"[Ariel] Think raw response: {thinking_response[:300]}")
         if tool_calls:
-            logging.info(f"[Ariel] Think proposed {len(tool_calls)} tool(s): {[tc['name'] for tc in tool_calls]}")
+            logging.warning(f"[Ariel] Think proposed {len(tool_calls)} tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in tool_calls]}")
         else:
-            logging.info(f"[Ariel] Think proposed no tools. Thought: {thought[:120] if thought else 'None'}")
+            logging.warning(f"[Ariel] Think proposed no tools. Thought: {thought[:120] if thought else 'None'}")
 
         # === 3. Separate read vs write tool calls ===
         read_calls = []
