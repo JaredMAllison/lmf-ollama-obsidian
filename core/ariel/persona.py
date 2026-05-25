@@ -9,7 +9,7 @@ from .session_yaml import SessionYAMLHandler
 from .write_intent import WriteIntentParser
 from kb_core import KnowledgeBase
 from lmf.build_prompt import build_manifest
-from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS
+from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS, _WRITE_TOOLS
 from lmf.backends import BackendError, RateLimitError
 
 
@@ -131,6 +131,27 @@ class ArielOrchestrator(Orchestrator):
                 )
         return None
 
+    @staticmethod
+    def _write_tool_args_to_dict(name: str, args: list) -> dict:
+        if name == "create_file":
+            return {"file_path": args[0], "content": args[1] if len(args) > 1 else ""}
+        if name == "append_to_file":
+            return {"file_path": args[0], "content": args[1] if len(args) > 1 else ""}
+        if name == "replace_lines":
+            return {
+                "file_path": args[0],
+                "start_line": int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 1,
+                "end_line": int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 1,
+                "new_content": args[3] if len(args) > 3 else "",
+            }
+        if name == "insert_after_heading":
+            return {
+                "file_path": args[0],
+                "heading": args[1] if len(args) > 1 else "",
+                "content": args[2] if len(args) > 2 else "",
+            }
+        return {"file_path": args[0] if args else "", "content": str(args)}
+
     def chat(self, user_message: str, timeout: int = 300) -> str:
         self.turn_number += 1
 
@@ -186,6 +207,13 @@ If you need to look up information in the vault, specify the tool calls you woul
   grep_vault("pattern")              — regex search across all files
   list_files()                       — list all vault notes
 
+If the user asks to create, edit, update, capture, or change content, propose write tool calls:
+
+  create_file("path", "content")               — create a new file at the given path
+  append_to_file("path", "content")            — append content to an existing file
+  replace_lines("path", start, end, "content") — replace a range of lines in a file
+  insert_after_heading("path", "heading", "content") — insert content after a named heading
+
 The vault also contains:
 - System/Skills/ — workflow definitions for common tasks
 - Learning/ — architecture patterns and coded principles
@@ -206,10 +234,20 @@ User message: {sanitized_input}"""
         thinking_response = self._call_backend(thinking_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
         thought, tool_calls = self.thinker.extract_thoughts_and_tools(thinking_response)
 
-        # === 3. Read (kb_core for search, base dispatch for I/O tools) with retry loop ===
+        # === 3. Separate read vs write tool calls ===
+        read_calls = []
+        write_calls = []
+        if tool_calls:
+            for tc in tool_calls:
+                if tc["name"] in _WRITE_TOOLS:
+                    write_calls.append(tc)
+                else:
+                    read_calls.append(tc)
+
+        # === 4. Read (execute read tools, vault search) with retry loop ===
         MAX_RETRIEVAL_ROUNDS = 3
         vault_context_parts = []
-        remaining_calls = list(tool_calls) if tool_calls else []
+        remaining_calls = list(read_calls) if read_calls else []
         rounds = 0
 
         while remaining_calls and rounds < MAX_RETRIEVAL_ROUNDS:
@@ -294,7 +332,15 @@ User message: {sanitized_input}"""
                     break
         vault_context = "\n\n---\n\n".join(vault_context_parts) if vault_context_parts else ""
 
-        # === 4. Respond (grounded — no history) ===
+        # === 5. Gate: format proposed writes as confirmation prompts ===
+        if write_calls:
+            first = write_calls[0]
+            args_dict = self._write_tool_args_to_dict(first["name"], first["args"])
+            proposal = _format_proposal(first["name"], args_dict)
+            self.pending_write = {"name": first["name"], "args": args_dict, "proposal": proposal}
+            return proposal
+
+        # === 6. Respond (grounded — no history) ===
         grounded_input = f"{sanitized_input}\n\n[Relevant Vault Context]:\n{vault_context}" if vault_context else sanitized_input
         grounded_input += (
             "\n\n[Gate note: No write was performed. "
@@ -302,11 +348,11 @@ User message: {sanitized_input}"""
         )
         response = self._call_backend_no_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
 
-        # === 5. Post-process warnings ===
+        # === 7. Post-process warnings ===
         if warning_detected:
             response = f"⚠️ **Potential Injection Detected**\n\n{response}"
 
-        # === 6. Session summary (compressed turn memory for next turn) ===
+        # === 8. Session summary (compressed turn memory for next turn) ===
         from lmf.orchestrator import SESSION_MEMORY_TURNS
         summary_prompt = (
             "Compress this turn into one brief line (max 20 words). "
@@ -319,16 +365,16 @@ User message: {sanitized_input}"""
         if len(self.session_memory) > SESSION_MEMORY_TURNS:
             self.session_memory = self.session_memory[-SESSION_MEMORY_TURNS:]
 
-        # === 7. Gated revival — check if model referenced a dismissed file ===
+        # === 9. Gated revival — check if model referenced a dismissed file ===
         revival_prompt = self._gated_revival(response)
         if revival_prompt:
             response += revival_prompt
 
-        # === 8. Age awareness (move old active→stale, evict old stale) ===
+        # === 10. Age awareness (move old active→stale, evict old stale) ===
         self._age_awareness()
         self._log_manifest_snapshot()
 
-        # === 9. Summarization (lightweight turns only, skipped in fresh-context mode) ===
+        # === 11. Summarization (lightweight turns only, skipped in fresh-context mode) ===
         if not self.fresh_context and self.memory.needs_summarization(self.history) and self._is_lightweight_turn(user_message):
             if not self.memory.pending_insight:
                 pinned_paths = list(self.awareness["pinned"].keys())
