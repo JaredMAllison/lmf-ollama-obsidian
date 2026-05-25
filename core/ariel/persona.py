@@ -328,8 +328,8 @@ User message: {sanitized_input}"""
         self._age_awareness()
         self._log_manifest_snapshot()
 
-        # === 9. Summarization (lightweight turns only) ===
-        if self.memory.needs_summarization(self.awareness) and self._is_lightweight_turn(user_message):
+        # === 9. Summarization (lightweight turns only, skipped in fresh-context mode) ===
+        if not self.fresh_context and self.memory.needs_summarization(self.history) and self._is_lightweight_turn(user_message):
             if not self.memory.pending_insight:
                 pinned_paths = list(self.awareness["pinned"].keys())
                 active_paths = list(self.awareness["active"].keys())
