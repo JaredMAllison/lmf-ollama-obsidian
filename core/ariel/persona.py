@@ -197,22 +197,29 @@ class ArielOrchestrator(Orchestrator):
 
         # === 2. Think (internal monologue) ===
         thinking_prompt = f"""You are Ariel's internal reasoning module.
-Determine what the user wants: READ (find information), or WRITE (create, edit, update content).
+Determine what the user wants: READ (find information), or WRITE (create, update, edit content).
 
-If the user asks to create, edit, update, update documentation, capture, save, add, or change content:
-  — You MUST propose write tool calls. Search the vault first with read tools if you need context.
+If the user asks to create, update, edit, update documentation, capture, save, add, or change content:
+  — You MUST propose write tool calls.
+  — FIRST read the target file with read_section or read_lines to see its current content.
+  — THEN propose the write tool to make the change.
+  — Always use full filenames with .md extension for vault files.
+  — For files with frontmatter (YAML between --- markers), use replace_lines to update specific lines.
+  — For adding content below a heading, use insert_after_heading.
+  — For appending to the end of a file, use append_to_file.
+  — For creating a brand new file, use create_file (not for existing files).
   — Available write tools:
-      create_file("path", "content")
-      append_to_file("path", "content")
-      replace_lines("path", start_line, end_line, "new_content")
-      insert_after_heading("path", "heading", "content")
+      create_file("path.md", "content")
+      append_to_file("path.md", "content")
+      replace_lines("path.md", start_line, end_line, "new_content")
+      insert_after_heading("path.md", "heading", "content")
 
 If the user asks to find or retrieve information, use read tools:
   — Available read tools:
       search_vault("query", "top_k")
-      read_section("path", "heading")
-      read_lines("path", start, end)
-      outline("path")
+      read_section("path.md", "heading")
+      read_lines("path.md", start, end)
+      outline("path.md")
       grep_vault("pattern")
       list_files()
 
@@ -222,10 +229,9 @@ The vault also contains:
 - Insights/ — design philosophy and self-knowledge
 If relevant, search_vault or grep_vault to check them.
 
-Output one or more Tool: lines for every action needed.
-FIRST read tools for context, THEN write tools for the update.
+Output Tool: lines for every action needed. Put read tools first (to get context), then write tools (to make the change).
 Do NOT skip write tools — if the user asked to update content, you MUST output a write tool.
-Do NOT output "No external lookup needed" — always reason and propose tools.
+Do NOT output "No external lookup needed" — always reason and propose.
 
 Format:
 Thought: [reasoning]
