@@ -6,7 +6,6 @@ from .guard import ArielGuard
 from .memory import ArielMemory
 from .session_yaml import SessionYAMLHandler
 from .write_intent import WriteIntentParser
-from kb_core import KnowledgeBase
 from lmf.build_prompt import build_manifest
 from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS
 from lmf.backends import BackendError, RateLimitError
@@ -175,7 +174,7 @@ _THINK_WRITE_TOOL_DEFS = [
 
 class ArielOrchestrator(Orchestrator):
     """Ariel‑specific orchestrator implementing Think‑Read‑Respond.
-    Uses kb_core for vault search (replaces Knowledge Loom).
+    Uses Knowledge Loom for vault search via _dispatch_tool → _tool_search.
     Fresh-context-per-turn: no growing history, only manifest.
     """
     def __init__(self, vault_path: str, test_mode: bool = False, tools_config_path=None):
@@ -186,15 +185,12 @@ class ArielOrchestrator(Orchestrator):
         self.session_yaml = SessionYAMLHandler(vault_path)
         self.ai_name = "Ariel"
 
-        # Initialize kb_core for vault search
-        self.kb = KnowledgeBase(Path(vault_path))
         self._write_parser = WriteIntentParser()
         self._capture_pending = None
 
         # Groq toggle
         raw = os.environ.get("PREFER_GROQ_FOR_THINK", "false")
         self.prefer_groq_for_think = raw.strip().lower() in ("true", "1", "yes")
-        logging.info(f"[Ariel] kb_core initialized — {len(self.kb.chunks)} chunks indexed")
         logging.info(f"[Ariel] prefer_groq_for_think={self.prefer_groq_for_think}")
         logging.info(f"[Ariel] fresh_context=True — no history, manifest-driven awareness")
 
@@ -389,14 +385,24 @@ User message: {sanitized_input}"""
                 tool_args = tc["args"]
                 try:
                     if tool_name == "search_vault":
-                        query = tool_args.get("query", "")
-                        top_k = int(tool_args.get("top_k", 5))
-                        results = self.kb.search(query, top_k=top_k)
+                        # Use the orchestrator's dispatch to route through Knowledge Loom
+                        args_dict = {"query": tool_args.get("query", ""), "top_k": int(tool_args.get("top_k", 5))}
+                        result_json = self._dispatch_tool(tool_name, args_dict)
+                        try:
+                            results = json.loads(result_json)
+                        except json.JSONDecodeError:
+                            results = []
+                        # Loom returns a list of dicts with keys: path, heading, line_start, score, snippet
                         for res in results:
-                            vault_context_parts.append(
-                                f"Source: {res['file']} - {res['heading']}\n{res['snippet']}"
-                            )
+                            path = res.get("path", "unknown")
+                            heading = res.get("heading", "")
+                            snippet = res.get("snippet", "")
+                            prefix = f"Source: {path}"
+                            if heading:
+                                prefix += f" - {heading}"
+                            vault_context_parts.append(f"{prefix}\n{snippet}")
                         continue
+
 
                     if tool_name == "read_section":
                         args_dict = {"file_path": tool_args["file_path"], "heading": tool_args["heading"]}
