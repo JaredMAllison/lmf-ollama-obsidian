@@ -70,3 +70,16 @@ tools:
       List all markdown files in the vault with line counts and file sizes.
       Use to discover what notes exist or to find the correct file path for
       other tools.
+  pin_vault_file:
+    enabled: true
+    description: >
+      Pin a vault note so it stays in the active awareness manifest across
+      turns. Pinned files are never evicted. Use when the operator says 'keep
+      this in mind' or explicitly requests a file stay loaded.
+  eject_vault_file:
+    enabled: true
+    description: >
+      Eject a vault note from the active awareness manifest. It moves to
+      dismissed. If never=true, suppress future revival prompts for this file.
+      Use when the operator says 'I'm done with that' or explicitly dismisses
+      a file they no longer need in context.
