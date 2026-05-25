@@ -4,13 +4,166 @@ import os
 from pathlib import Path
 from .guard import ArielGuard
 from .memory import ArielMemory
-from .thinking import ArielThinking
 from .session_yaml import SessionYAMLHandler
 from .write_intent import WriteIntentParser
 from kb_core import KnowledgeBase
 from lmf.build_prompt import build_manifest
 from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS, _WRITE_TOOLS
 from lmf.backends import BackendError, RateLimitError
+
+
+_THINK_TOOL_DEFS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_vault",
+            "description": "Full-text BM25 search across all vault notes. Use when you don't know the exact file path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "top_k": {"type": "integer", "description": "Number of results (default 5)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_section",
+            "description": "Read content under a named heading from a vault note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "heading": {"type": "string", "description": "Heading name (substring match)"},
+                },
+                "required": ["file_path", "heading"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_lines",
+            "description": "Read a 1-indexed line range from a vault file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "start_line": {"type": "integer", "description": "First line number"},
+                    "end_line": {"type": "integer", "description": "Last line number"},
+                },
+                "required": ["file_path", "start_line", "end_line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "outline",
+            "description": "Get heading hierarchy of a vault note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_vault",
+            "description": "Regex search across all vault .md files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern (case-insensitive)"},
+                    "file_filter": {"type": "string", "description": "Optional file glob filter"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List all markdown files in the vault.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_lines",
+            "description": "Replace lines in a vault file. Replaces lines start through end INCLUSIVE with new_content. To change a single line, set start = end.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "start_line": {"type": "integer", "description": "First line to replace (1-indexed)"},
+                    "end_line": {"type": "integer", "description": "Last line to replace (1-indexed, inclusive)"},
+                    "new_content": {"type": "string", "description": "Replacement content"},
+                },
+                "required": ["file_path", "start_line", "end_line", "new_content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_to_file",
+            "description": "Append content to the end of an existing vault file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "content": {"type": "string", "description": "Content to append"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Create a new vault note at the given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "content": {"type": "string", "description": "Full file content"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_after_heading",
+            "description": "Insert content after a named heading in a vault file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Vault-relative path with .md extension"},
+                    "heading": {"type": "string", "description": "Heading name (substring match)"},
+                    "content": {"type": "string", "description": "Content to insert"},
+                },
+                "required": ["file_path", "heading", "content"],
+            },
+        },
+    },
+]
 
 
 class ArielOrchestrator(Orchestrator):
@@ -23,7 +176,6 @@ class ArielOrchestrator(Orchestrator):
         self.fresh_context = True
         self.guard = ArielGuard()
         self.memory = ArielMemory(vault_path, self.loom_url)
-        self.thinker = ArielThinking()
         self.session_yaml = SessionYAMLHandler(vault_path)
         self.ai_name = "Ariel"
 
@@ -62,21 +214,32 @@ class ArielOrchestrator(Orchestrator):
             "available tools to look it up."
         )
 
-    def _call_backend(self, prompt: str, timeout: int = 300, prefer_backend: str | None = None) -> str:
-        """Single backend call with manifest-injected system prompt."""
+    def _call_backend_think(self, prompt: str, timeout: int = 300) -> tuple[str, list]:
+        """Backend call for Think step — passes structured tool definitions.
+        Returns (reasoning_text, tool_calls_list).
+        Each tool_call: {"name": str, "args": dict, "id": str}
+        """
         system = self._build_system_with_manifest()
         messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
 
         ordered = BACKENDS[:]
-        if prefer_backend:
-            ordered = sorted(BACKENDS, key=lambda x: (0 if x[1].name == prefer_backend else 1, x[0]))
+        if self.prefer_groq_for_think:
+            ordered = sorted(BACKENDS, key=lambda x: (0 if x[1].name == "groq" else 1, x[0]))
 
         for _, backend in ordered:
             if not backend.is_available:
                 continue
             try:
-                result = backend.chat(messages, tools=None, timeout=timeout)
-                return result.content
+                result = backend.chat(messages, tools=_THINK_TOOL_DEFS, timeout=timeout)
+                tool_calls = []
+                if result.tool_calls:
+                    for tc in result.tool_calls:
+                        tool_calls.append({
+                            "name": tc.function.name,
+                            "args": json.loads(tc.function.arguments),
+                            "id": tc.id,
+                        })
+                return result.content or "", tool_calls
             except RateLimitError as e:
                 logging.warning(f"[Ariel] {backend.name} rate limited: {e}")
                 continue
@@ -84,7 +247,21 @@ class ArielOrchestrator(Orchestrator):
                 logging.warning(f"[Ariel] {backend.name} error: {e}")
                 continue
         logging.warning("[Ariel] All backends exhausted")
-        return "[All backends exhausted]"
+        return "[All backends exhausted]", []
+
+    def _call_backend(self, prompt: str, timeout: int = 300) -> str:
+        """Simple text completion backend call (no tools). For summary/summarization."""
+        system = self._build_system_with_manifest()
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        for _, backend in BACKENDS:
+            if not backend.is_available:
+                continue
+            try:
+                return backend.chat(messages, tools=None, timeout=timeout).content
+            except (RateLimitError, BackendError) as e:
+                logging.warning(f"[Ariel] {backend.name} error: {e}")
+                continue
+        return ""
 
     def _call_backend_no_history(self, user_message: str, timeout: int = 300, prefer_backend: str | None = None) -> str:
         """Respond step backend call — no history, just current turn + manifest."""
@@ -131,27 +308,6 @@ class ArielOrchestrator(Orchestrator):
                 )
         return None
 
-    @staticmethod
-    def _write_tool_args_to_dict(name: str, args: list) -> dict:
-        if name == "create_file":
-            return {"file_path": args[0], "content": args[1] if len(args) > 1 else ""}
-        if name == "append_to_file":
-            return {"file_path": args[0], "content": args[1] if len(args) > 1 else ""}
-        if name == "replace_lines":
-            return {
-                "file_path": args[0],
-                "start_line": int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 1,
-                "end_line": int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 1,
-                "new_content": args[3] if len(args) > 3 else "",
-            }
-        if name == "insert_after_heading":
-            return {
-                "file_path": args[0],
-                "heading": args[1] if len(args) > 1 else "",
-                "content": args[2] if len(args) > 2 else "",
-            }
-        return {"file_path": args[0] if args else "", "content": str(args)}
-
     def chat(self, user_message: str, timeout: int = 300) -> str:
         self.turn_number += 1
 
@@ -195,62 +351,19 @@ class ArielOrchestrator(Orchestrator):
         # === 1. Sanitize ===
         sanitized_input, warning_detected = self.guard.sanitize(user_message)
 
-        # === 2. Think (internal monologue) ===
+        # === 2. Think (internal monologue with structured tools) ===
         thinking_prompt = f"""You are Ariel's internal reasoning module.
-Determine what the user wants: READ (find information), or WRITE (create, update, edit content).
-
-If the user asks to create, update, edit, update documentation, capture, save, add, or change content:
-  — You MUST propose write tool calls.
-  — Always output a read tool FIRST to get the file's current content.
-  — Then output the write tool with the exact path from the read result.
-  — Always use full filenames with .md extension for vault files.
-  — For files with frontmatter (YAML between --- markers), use replace_lines to update specific lines.
-  — For adding content below a heading, use insert_after_heading.
-  — For appending to the end of a file, use append_to_file.
-  — For creating a brand new file, use create_file (not for existing files).
-  — Available write tools:
-      create_file("path.md", "content")
-      append_to_file("path.md", "content")
-      replace_lines("path.md", start_line, end_line, "new_content")
-      insert_after_heading("path.md", "heading", "content")
-
-Example — user says "update reschedule-dental-appointment.md with Aug 3":
-  Thought: I need to read the task file first to see current content, then update the date.
-  Tool: read_lines("Tasks/reschedule-dental-appointment.md", 1, 30)
-  Tool: replace_lines("Tasks/reschedule-dental-appointment.md", 3, 5, "goal_date: 2026-08-03")
-
-If the user asks to find or retrieve information, use read tools:
-  — Available read tools:
-      search_vault("query", "top_k")
-      read_section("path.md", "heading")
-      read_lines("path.md", start, end)
-      outline("path.md")
-      grep_vault("pattern")
-      list_files()
-
-The vault also contains:
-- System/Skills/ — workflow definitions for common tasks
-- Learning/ — architecture patterns and coded principles
-- Insights/ — design philosophy and self-knowledge
-If relevant, search_vault or grep_vault to check them.
-
-Always output Tool: lines for every action. Read first (to get context), then write (to make the change).
-Do NOT skip write tools. Do NOT use placeholder paths like "path.md".
-Do NOT output "No external lookup needed".
-
-Format:
-Thought: [reasoning]
-Tool: read_tool("args")
-Tool: write_tool("args")
+Think about what the user needs — read information, or create/update content.
+If a write is needed, read the file FIRST to see its content, then propose the write.
+Use the available tools to look up information, then propose writes if needed.
 
 User message: {sanitized_input}"""
-        thinking_response = self._call_backend(thinking_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
-        thought, tool_calls = self.thinker.extract_thoughts_and_tools(thinking_response)
-        logging.warning(f"[Ariel] Think raw response: {thinking_response[:300]}")
+        thinking_response, tool_calls = self._call_backend_think(thinking_prompt, timeout)
+        logging.warning(f"[Ariel] Think: {thinking_response[:200]}")
         if tool_calls:
             logging.warning(f"[Ariel] Think proposed {len(tool_calls)} tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in tool_calls]}")
         else:
-            logging.warning(f"[Ariel] Think proposed no tools. Thought: {thought[:120] if thought else 'None'}")
+            logging.warning(f"[Ariel] Think proposed no tools")
 
         # === 3. Separate read vs write tool calls ===
         read_calls = []
@@ -277,8 +390,8 @@ User message: {sanitized_input}"""
                 tool_args = tc["args"]
                 try:
                     if tool_name == "search_vault":
-                        query = tool_args[0] if len(tool_args) >= 1 else ""
-                        top_k = int(tool_args[1]) if len(tool_args) >= 2 and str(tool_args[1]).isdigit() else 5
+                        query = tool_args.get("query", "")
+                        top_k = int(tool_args.get("top_k", 5))
                         results = self.kb.search(query, top_k=top_k)
                         for res in results:
                             vault_context_parts.append(
@@ -286,15 +399,14 @@ User message: {sanitized_input}"""
                             )
                         continue
 
-                    args_dict = {}
-                    if tool_name == "read_section" and len(tool_args) >= 2:
-                        args_dict = {"file_path": tool_args[0], "heading": tool_args[1]}
-                    elif tool_name == "read_lines" and len(tool_args) >= 3:
-                        args_dict = {"file_path": tool_args[0], "start_line": int(tool_args[1]), "end_line": int(tool_args[2])}
-                    elif tool_name == "outline" and len(tool_args) >= 1:
-                        args_dict = {"file_path": tool_args[0]}
-                    elif tool_name == "grep_vault" and len(tool_args) >= 1:
-                        args_dict = {"pattern": tool_args[0], "file_filter": tool_args[1] if len(tool_args) >= 2 else None}
+                    if tool_name == "read_section":
+                        args_dict = {"file_path": tool_args["file_path"], "heading": tool_args["heading"]}
+                    elif tool_name == "read_lines":
+                        args_dict = {"file_path": tool_args["file_path"], "start_line": int(tool_args["start_line"]), "end_line": int(tool_args["end_line"])}
+                    elif tool_name == "outline":
+                        args_dict = {"file_path": tool_args["file_path"]}
+                    elif tool_name == "grep_vault":
+                        args_dict = {"pattern": tool_args["pattern"], "file_filter": tool_args.get("file_filter")}
                     elif tool_name == "list_files":
                         args_dict = {}
                     else:
@@ -343,9 +455,8 @@ User message: {sanitized_input}"""
                 retry_prompt = f"""Your previous retrieval returned no useful results.
         Original query: {sanitized_input}
         Tools tried: {[tc['name'] for tc in remaining_calls]}
-        Try different search terms or a different tool. Output new Tool: calls only."""
-                retry_response = self._call_backend(retry_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
-                _, remaining_calls = self.thinker.extract_thoughts_and_tools(retry_response)
+        Try different search terms or a different tool."""
+                _, remaining_calls = self._call_backend_think(retry_prompt, timeout)
                 if not remaining_calls:
                     break
         vault_context = "\n\n---\n\n".join(vault_context_parts) if vault_context_parts else ""
@@ -353,7 +464,7 @@ User message: {sanitized_input}"""
         # === 5. Re-Think: if writes proposed and reads returned context, refine args ===
         if write_calls and vault_context:
             original_tools_str = "\n".join(
-                f"  {tc['name']}({', '.join(repr(a) for a in tc['args'])})" for tc in write_calls
+                f"  {tc['name']}({', '.join(repr(v) for v in tc['args'].values())})" for tc in write_calls
             )
             rethink_prompt = (
                 "You previously proposed these write tool calls:\n"
@@ -361,17 +472,9 @@ User message: {sanitized_input}"""
                 "Read results show the current file content:\n"
                 f"{vault_context[:2000]}\n\n"
                 "Now output ONLY the write tool calls with EXACT content and REAL line numbers "
-                "based on the file content above.\n"
-                "IMPORTANT — replace_lines semantics:\n"
-                "  replace_lines(path, start, end, content) replaces lines start through end INCLUSIVE.\n"
-                "  To change a single line: use the same number for start and end.\n"
-                "  Example: replace_lines(\"file.md\", 3, 3, \"new content for line 3\")\n"
-                "  Do NOT replace extra lines — replace only the exact line(s) that need changing.\n"
-                "Replace any placeholder arguments with actual values from the file.\n"
-                "Do NOT include read tools — only write tools."
+                "based on the file content above."
             )
-            rethink_response = self._call_backend(rethink_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
-            _, new_write_calls = self.thinker.extract_thoughts_and_tools(rethink_response)
+            _, new_write_calls = self._call_backend_think(rethink_prompt, timeout)
             if new_write_calls:
                 write_calls = [tc for tc in new_write_calls if tc["name"] in _WRITE_TOOLS]
             logging.warning(f"[Ariel] Re-Think produced {len(write_calls)} write tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in write_calls]}")
@@ -379,9 +482,8 @@ User message: {sanitized_input}"""
         # === 6. Gate: format proposed writes as confirmation prompts ===
         if write_calls:
             first = write_calls[0]
-            args_dict = self._write_tool_args_to_dict(first["name"], first["args"])
-            proposal = _format_proposal(first["name"], args_dict)
-            self.pending_write = {"name": first["name"], "args": args_dict, "proposal": proposal}
+            proposal = _format_proposal(first["name"], first["args"])
+            self.pending_write = {"name": first["name"], "args": first["args"], "proposal": proposal}
             return proposal
 
         # === 7. Respond (grounded — no history) ===
