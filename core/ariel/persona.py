@@ -30,6 +30,7 @@ class ArielOrchestrator(Orchestrator):
         # Initialize kb_core for vault search
         self.kb = KnowledgeBase(Path(vault_path))
         self._write_parser = WriteIntentParser()
+        self._capture_pending = None
 
         # Groq toggle
         raw = os.environ.get("PREFER_GROQ_FOR_THINK", "true")
@@ -163,22 +164,12 @@ class ArielOrchestrator(Orchestrator):
                 self.pending_write = None
                 return "Okay, I won't make that change."
 
-        # === Capture Flow State — resume multi-turn capture ===
-        if self._capture_pending:
-            return self._handle_capture_response(user_message, timeout)
-
         # === Write Intent Detection ===
         intent = self._write_parser.parse(user_message)
         if intent:
             proposal = _format_proposal(intent.tool, intent.args)
             self.pending_write = {"name": intent.tool, "args": intent.args, "proposal": proposal}
             return proposal
-
-        # === Capture Flow Detection ===
-        capture_content = self._write_parser.detect_capture_flow(user_message)
-        if capture_content:
-            self._capture_pending = {"content": capture_content, "target": None}
-            return "Task, project, or inbox?"
 
         # === 1. Sanitize ===
         sanitized_input, warning_detected = self.guard.sanitize(user_message)

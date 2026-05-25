@@ -1,0 +1,63 @@
+avg_response_ms: 14666
+content_match_rate: 0.3333
+date: '2026-05-12'
+gpu_accelerated: false
+grounding_rate: 0.0
+hallucination_rate: 0.0
+inference_host: TPC-2026-Jared
+model: qwen2.5:3b
+prompt_results:
+- expected_tool: null
+  grounding_term: null
+  id: W001
+  passed: false
+  response: '[All backends exhausted: ollama unreachable]'
+  response_ms: 8001
+  tool_calls_made: []
+  type: write_exercise
+- expected_tool: null
+  grounding_term: null
+  id: W002
+  passed: false
+  response: '[All backends exhausted: None]'
+  response_ms: 15999
+  tool_calls_made: []
+  type: write_exercise
+- expected_tool: null
+  grounding_term: null
+  id: W003
+  passed: false
+  response: '[All backends exhausted: None]'
+  response_ms: 16000
+  tool_calls_made: []
+  type: write_exercise
+- expected_tool: null
+  grounding_term: null
+  id: W004
+  passed: false
+  response: '[All backends exhausted: None]'
+  response_ms: 16000
+  tool_calls_made: []
+  type: write_exercise
+- expected_tool: null
+  grounding_term: null
+  id: W005
+  passed: false
+  response: '[All backends exhausted: None]'
+  response_ms: 15999
+  tool_calls_made: []
+  type: write_exercise
+- expected_tool: null
+  grounding_term: null
+  id: W006
+  passed: false
+  response: '[All backends exhausted: None]'
+  response_ms: 16000
+  tool_calls_made: []
+  type: write_exercise
+stability_tier: 0
+tool_accuracy: 0.0
+tool_enforcement_pass: true
+vault_type: synthetic
+write_confirm_rate: 0.0
+write_gate_rate: 0.0

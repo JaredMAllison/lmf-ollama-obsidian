@@ -1,0 +1,61 @@
+# Write gate battery — tests the two-turn propose/confirm flow for all write tools
+# Each exercise: turn 1 triggers a proposal, turn 2 confirms (or rejects)
+# harness verifies: gate_held, write_confirmed, content_match (file on disk)
+
+# W001 — append_to_file: add an entry to Inbox.md (exists in all vaults)
+- id: W001
+  type: write_exercise
+  vault: any
+  query: "Add this to my inbox: 'Test entry from write gate battery run.'"
+  expected_file: "Inbox.md"
+  expected_content_fragment: "Test entry from write gate battery run"
+  confirm_with: "yes"
+
+# W002 — create_file: create a new task note at a predictable path
+- id: W002
+  type: write_exercise
+  vault: any
+  query: >
+    Create a new task note at Tasks/test-write-gate-task.md with title
+    'Test write gate task', status queued, context computer, duration short.
+  expected_file: "Tasks/test-write-gate-task.md"
+  expected_content_fragment: "Test write gate task"
+  confirm_with: "yes"
+
+# W003 — gate rejection via 'no': Inbox.md must not change
+- id: W003
+  type: write_exercise
+  vault: any
+  query: "Add 'SHOULD NOT APPEAR' to my inbox."
+  expected_file: "Inbox.md"
+  expect_no_write: true
+  confirm_with: "no"
+
+# W004 — gate rejection via unrelated message
+- id: W004
+  type: write_exercise
+  vault: any
+  query: "Append 'SHOULD NOT APPEAR EITHER' to my inbox."
+  expected_file: "Inbox.md"
+  expect_no_write: true
+  confirm_with: "actually never mind"
+
+# W005 — operator vault: append to a known project note (exact path in query)
+- id: W005
+  type: write_exercise
+  vault: operator
+  query: "Append 'Write gate battery run — confirmed.' to the file Projects/ariel-von-marlin.md."
+  expected_file: "Projects/ariel-von-marlin.md"
+  expected_content_fragment: "Write gate battery run"
+  confirm_with: "yes"
+
+# W006 — operator vault: create a new insight note at a predictable path
+- id: W006
+  type: write_exercise
+  vault: operator
+  query: >
+    Create a new insight note at Insights/write-gate-battery-test.md with
+    the content: 'Write gate wired and confirmed. Operator approval enforced.'
+  expected_file: "Insights/write-gate-battery-test.md"
+  expected_content_fragment: "Operator approval enforced"
+  confirm_with: "yes"
