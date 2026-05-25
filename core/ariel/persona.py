@@ -8,11 +8,15 @@ from .session_yaml import SessionYAMLHandler
 from .write_intent import WriteIntentParser
 from kb_core import KnowledgeBase
 from lmf.build_prompt import build_manifest
-from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS, _WRITE_TOOLS
+from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS
 from lmf.backends import BackendError, RateLimitError
 
 
-_THINK_TOOL_DEFS = [
+_READ_TOOL_NAMES = {"search_vault", "read_section", "read_lines", "outline", "grep_vault", "list_files", "pin_vault_file", "eject_vault_file"}
+_WRITE_TOOL_NAMES = {"replace_lines", "append_to_file", "create_file", "insert_after_heading"}
+_WRITE_KEYWORDS = {"update", "change", "add", "create", "set", "edit", "modify", "remove", "delete", "rename", "write", "capture"}
+
+_THINK_READ_TOOL_DEFS = [
     {
         "type": "function",
         "function": {
@@ -100,6 +104,9 @@ _THINK_TOOL_DEFS = [
             },
         },
     },
+]
+
+_THINK_WRITE_TOOL_DEFS = [
     {
         "type": "function",
         "function": {
@@ -214,11 +221,14 @@ class ArielOrchestrator(Orchestrator):
             "available tools to look it up."
         )
 
-    def _call_backend_think(self, prompt: str, timeout: int = 300) -> tuple[str, list]:
+    def _call_backend_think(self, prompt: str, timeout: int = 300, tool_defs: list | None = None) -> tuple[str, list]:
         """Backend call for Think step — passes structured tool definitions.
+        Accepts a tool_defs list (read or write specific). Defaults to all tools.
         Returns (reasoning_text, tool_calls_list).
-        Each tool_call: {"name": str, "args": dict, "id": str}
+        Each tool_call: {"name": str, "args": dict}
         """
+        if tool_defs is None:
+            tool_defs = _THINK_READ_TOOL_DEFS
         system = self._build_system_with_manifest()
         messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
 
@@ -230,7 +240,7 @@ class ArielOrchestrator(Orchestrator):
             if not backend.is_available:
                 continue
             try:
-                result = backend.chat(messages, tools=_THINK_TOOL_DEFS, timeout=timeout)
+                result = backend.chat(messages, tools=tool_defs, timeout=timeout)
                 tool_calls = []
                 if result.tool_calls:
                     for tc in result.tool_calls:
@@ -351,31 +361,20 @@ class ArielOrchestrator(Orchestrator):
         # === 1. Sanitize ===
         sanitized_input, warning_detected = self.guard.sanitize(user_message)
 
-        # === 2. Think (internal monologue with structured tools) ===
-        thinking_prompt = f"""The user wants to read information or update content.
-You MUST call the available tools to fulfill the request.
-If a file path is given, call read_lines first.
-Then call the appropriate write tool. Do not just search — read and write directly.
+        # === 2. Think-Read (read tools only — model reads what it needs) ===
+        think_read_prompt = f"""The user wants to read or update vault content.
+Call read tools to find the relevant information.
+If a file path is given, call read_lines directly on that file.
 
 User message: {sanitized_input}"""
-        thinking_response, tool_calls = self._call_backend_think(thinking_prompt, timeout)
-        logging.warning(f"[Ariel] Think: {thinking_response[:200]}")
-        if tool_calls:
-            logging.warning(f"[Ariel] Think proposed {len(tool_calls)} tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in tool_calls]}")
+        thinking_response, read_calls = self._call_backend_think(think_read_prompt, timeout, _THINK_READ_TOOL_DEFS)
+        logging.warning(f"[Ariel] Think-Read: {thinking_response[:200]}")
+        if read_calls:
+            logging.warning(f"[Ariel] Think-Read proposed {len(read_calls)} tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in read_calls]}")
         else:
-            logging.warning(f"[Ariel] Think proposed no tools")
+            logging.warning(f"[Ariel] Think-Read proposed no tools")
 
-        # === 3. Separate read vs write tool calls ===
-        read_calls = []
-        write_calls = []
-        if tool_calls:
-            for tc in tool_calls:
-                if tc["name"] in _WRITE_TOOLS:
-                    write_calls.append(tc)
-                else:
-                    read_calls.append(tc)
-
-        # === 4. Read (execute read tools, vault search) with retry loop ===
+        # === 3. Execute read tools (with retry loop) ===
         MAX_RETRIEVAL_ROUNDS = 3
         vault_context_parts = []
         remaining_calls = list(read_calls) if read_calls else []
@@ -456,37 +455,37 @@ User message: {sanitized_input}"""
         Original query: {sanitized_input}
         Tools tried: {[tc['name'] for tc in remaining_calls]}
         Try different search terms or a different tool."""
-                _, remaining_calls = self._call_backend_think(retry_prompt, timeout)
+                _, remaining_calls = self._call_backend_think(retry_prompt, timeout, _THINK_READ_TOOL_DEFS)
                 if not remaining_calls:
                     break
         vault_context = "\n\n---\n\n".join(vault_context_parts) if vault_context_parts else ""
 
-        # === 5. Re-Think: if writes proposed and reads returned context, refine args ===
-        if write_calls and vault_context:
-            original_tools_str = "\n".join(
-                f"  {tc['name']}({', '.join(repr(v) for v in tc['args'].values())})" for tc in write_calls
-            )
-            rethink_prompt = (
-                "You previously proposed these write tool calls:\n"
-                f"{original_tools_str}\n\n"
-                "Read results show the current file content:\n"
-                f"{vault_context[:2000]}\n\n"
-                "Now output ONLY the write tool calls with EXACT content and REAL line numbers "
-                "based on the file content above."
-            )
-            _, new_write_calls = self._call_backend_think(rethink_prompt, timeout)
-            if new_write_calls:
-                write_calls = [tc for tc in new_write_calls if tc["name"] in _WRITE_TOOLS]
-            logging.warning(f"[Ariel] Re-Think produced {len(write_calls)} write tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in write_calls]}")
+        # === 4. Think-Write (write tools only, with vault context) ===
+        write_calls = []
+        if vault_context and any(kw in sanitized_input.lower() for kw in _WRITE_KEYWORDS):
+            think_write_prompt = f"""The user wants to update vault content.
+Using the file content below, call the write tool to make the change.
+Use exact content and real line numbers from the file shown.
 
-        # === 6. Gate: format proposed writes as confirmation prompts ===
+--- File content ---
+{vault_context[:3000]}
+---
+User request: {sanitized_input}"""
+            _, write_calls = self._call_backend_think(think_write_prompt, timeout, _THINK_WRITE_TOOL_DEFS)
+            if write_calls:
+                write_calls = [tc for tc in write_calls if tc["name"] in _WRITE_TOOL_NAMES]
+                logging.warning(f"[Ariel] Think-Write proposed {len(write_calls)} tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in write_calls]}")
+            else:
+                logging.warning("[Ariel] Think-Write proposed no tools")
+
+        # === 5. Gate: format proposed writes as confirmation prompts ===
         if write_calls:
             first = write_calls[0]
             proposal = _format_proposal(first["name"], first["args"])
             self.pending_write = {"name": first["name"], "args": first["args"], "proposal": proposal}
             return proposal
 
-        # === 7. Respond (grounded — no history) ===
+        # === 6. Respond (grounded — no history) ===
         grounded_input = f"{sanitized_input}\n\n[Relevant Vault Context]:\n{vault_context}" if vault_context else sanitized_input
         grounded_input += (
             "\n\nCRITICAL: You did NOT write anything. No files were modified. "
@@ -495,11 +494,11 @@ User message: {sanitized_input}"""
         )
         response = self._call_backend_no_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
 
-        # === 8. Post-process warnings ===
+        # === 7. Post-process warnings ===
         if warning_detected:
             response = f"⚠️ **Potential Injection Detected**\n\n{response}"
 
-        # === 9. Session summary (compressed turn memory for next turn) ===
+        # === 8. Session summary (compressed turn memory for next turn) ===
         from lmf.orchestrator import SESSION_MEMORY_TURNS
         summary_prompt = (
             "Compress this turn into one brief line (max 20 words). "
@@ -512,16 +511,16 @@ User message: {sanitized_input}"""
         if len(self.session_memory) > SESSION_MEMORY_TURNS:
             self.session_memory = self.session_memory[-SESSION_MEMORY_TURNS:]
 
-        # === 10. Gated revival — check if model referenced a dismissed file ===
+        # === 9. Gated revival — check if model referenced a dismissed file ===
         revival_prompt = self._gated_revival(response)
         if revival_prompt:
             response += revival_prompt
 
-        # === 11. Age awareness (move old active→stale, evict old stale) ===
+        # === 10. Age awareness (move old active→stale, evict old stale) ===
         self._age_awareness()
         self._log_manifest_snapshot()
 
-        # === 12. Summarization (lightweight turns only, skipped in fresh-context mode) ===
+        # === 11. Summarization (lightweight turns only, skipped in fresh-context mode) ===
         if not self.fresh_context and self.memory.needs_summarization(self.history) and self._is_lightweight_turn(user_message):
             if not self.memory.pending_insight:
                 pinned_paths = list(self.awareness["pinned"].keys())

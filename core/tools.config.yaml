@@ -48,8 +48,8 @@ tools:
       use to create a new file — call create_file for that. Do NOT use to insert
       at a specific position — call insert_after_heading for that.
   replace_lines:
-    enabled: false
-    description: "Replace lines in a vault note (write — disabled pending access model)"
+    enabled: true
+    description: "Replace lines in a vault note"
   create_file:
     enabled: true
     description: >
