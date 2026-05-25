@@ -1,5 +1,6 @@
 import re
 
+
 class ArielThinking:
     """Parse the LLM's internal monologue output.
     Expected format:
@@ -9,6 +10,14 @@ class ArielThinking:
     """
     THOUGHT_RE = re.compile(r"Thought:\s*(.*)", re.IGNORECASE)
     TOOL_RE = re.compile(r"Tool:\s*(\w+)\((.*)\)", re.IGNORECASE)
+
+    @staticmethod
+    def _decode_escapes(value: str) -> str:
+        """Decode \\n, \\t, \\\" etc escape sequences in a string."""
+        try:
+            return bytes(value, "utf-8").decode("unicode_escape")
+        except Exception:
+            return value
 
     def extract_thoughts_and_tools(self, text: str):
         thought_match = self.THOUGHT_RE.search(text)
@@ -25,6 +34,7 @@ class ArielThinking:
                     a = a.strip()
                     if (a.startswith('"') and a.endswith('"')) or (a.startswith("'") and a.endswith("'")):
                         a = a[1:-1]
+                    a = self._decode_escapes(a)
                     args.append(a)
             tools.append({"name": name, "args": args})
         return thought, tools

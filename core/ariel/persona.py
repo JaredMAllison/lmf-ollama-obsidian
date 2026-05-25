@@ -350,7 +350,27 @@ User message: {sanitized_input}"""
                     break
         vault_context = "\n\n---\n\n".join(vault_context_parts) if vault_context_parts else ""
 
-        # === 5. Gate: format proposed writes as confirmation prompts ===
+        # === 5. Re-Think: if writes proposed and reads returned context, refine args ===
+        if write_calls and vault_context:
+            original_tools_str = "\n".join(
+                f"  {tc['name']}({', '.join(repr(a) for a in tc['args'])})" for tc in write_calls
+            )
+            rethink_prompt = (
+                "You previously proposed these write tool calls:\n"
+                f"{original_tools_str}\n\n"
+                "Read results show the current file content:\n"
+                f"{vault_context[:2000]}\n\n"
+                "Now output ONLY the write tool calls with EXACT content and REAL line numbers "
+                "based on the file content above. Replace any placeholder arguments with actual values. "
+                "Do NOT include read tools — only write tools."
+            )
+            rethink_response = self._call_backend(rethink_prompt, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
+            _, new_write_calls = self.thinker.extract_thoughts_and_tools(rethink_response)
+            if new_write_calls:
+                write_calls = [tc for tc in new_write_calls if tc["name"] in _WRITE_TOOLS]
+            logging.warning(f"[Ariel] Re-Think produced {len(write_calls)} write tool(s): {[{'name': tc['name'], 'args': tc['args']} for tc in write_calls]}")
+
+        # === 6. Gate: format proposed writes as confirmation prompts ===
         if write_calls:
             first = write_calls[0]
             args_dict = self._write_tool_args_to_dict(first["name"], first["args"])
@@ -358,7 +378,7 @@ User message: {sanitized_input}"""
             self.pending_write = {"name": first["name"], "args": args_dict, "proposal": proposal}
             return proposal
 
-        # === 6. Respond (grounded — no history) ===
+        # === 7. Respond (grounded — no history) ===
         grounded_input = f"{sanitized_input}\n\n[Relevant Vault Context]:\n{vault_context}" if vault_context else sanitized_input
         grounded_input += (
             "\n\n[Gate note: No write was performed. "
@@ -366,11 +386,11 @@ User message: {sanitized_input}"""
         )
         response = self._call_backend_no_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
 
-        # === 7. Post-process warnings ===
+        # === 8. Post-process warnings ===
         if warning_detected:
             response = f"⚠️ **Potential Injection Detected**\n\n{response}"
 
-        # === 8. Session summary (compressed turn memory for next turn) ===
+        # === 9. Session summary (compressed turn memory for next turn) ===
         from lmf.orchestrator import SESSION_MEMORY_TURNS
         summary_prompt = (
             "Compress this turn into one brief line (max 20 words). "
@@ -383,16 +403,16 @@ User message: {sanitized_input}"""
         if len(self.session_memory) > SESSION_MEMORY_TURNS:
             self.session_memory = self.session_memory[-SESSION_MEMORY_TURNS:]
 
-        # === 9. Gated revival — check if model referenced a dismissed file ===
+        # === 10. Gated revival — check if model referenced a dismissed file ===
         revival_prompt = self._gated_revival(response)
         if revival_prompt:
             response += revival_prompt
 
-        # === 10. Age awareness (move old active→stale, evict old stale) ===
+        # === 11. Age awareness (move old active→stale, evict old stale) ===
         self._age_awareness()
         self._log_manifest_snapshot()
 
-        # === 11. Summarization (lightweight turns only, skipped in fresh-context mode) ===
+        # === 12. Summarization (lightweight turns only, skipped in fresh-context mode) ===
         if not self.fresh_context and self.memory.needs_summarization(self.history) and self._is_lightweight_turn(user_message):
             if not self.memory.pending_insight:
                 pinned_paths = list(self.awareness["pinned"].keys())
