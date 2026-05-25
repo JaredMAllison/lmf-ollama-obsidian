@@ -8,66 +8,63 @@ from .thinking import ArielThinking
 from .session_yaml import SessionYAMLHandler
 from .write_intent import WriteIntentParser
 from kb_core import KnowledgeBase
-from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal
+from lmf.build_prompt import build_manifest
+from lmf.orchestrator import Orchestrator, is_confirmation, _format_proposal, BACKENDS
+from lmf.backends import BackendError, RateLimitError
+
 
 class ArielOrchestrator(Orchestrator):
     """Ariel‑specific orchestrator implementing Think‑Read‑Respond.
     Uses kb_core for vault search (replaces Knowledge Loom).
+    Fresh-context-per-turn: no growing history, only manifest.
     """
     def __init__(self, vault_path: str, test_mode: bool = False, tools_config_path=None):
         super().__init__(vault_path, test_mode, tools_config_path=tools_config_path)
+        self.fresh_context = True
         self.guard = ArielGuard()
         self.memory = ArielMemory(vault_path, self.loom_url)
         self.thinker = ArielThinking()
         self.session_yaml = SessionYAMLHandler(vault_path)
         self.ai_name = "Ariel"
 
-        # Initialize kb_core for vault search (replaces Loom dependency)
+        # Initialize kb_core for vault search
         self.kb = KnowledgeBase(Path(vault_path))
         self._write_parser = WriteIntentParser()
-        self._capture_pending = None  # multi-turn capture flow state: {"content": str, "target": str | None}
 
-        # Groq toggle — prefer Groq for Think/Respond if available
-        # Default: on (Groq preferred). Off = use priority-ordered backends (Ollama first)
+        # Groq toggle
         raw = os.environ.get("PREFER_GROQ_FOR_THINK", "true")
         self.prefer_groq_for_think = raw.strip().lower() in ("true", "1", "yes")
         logging.info(f"[Ariel] kb_core initialized — {len(self.kb.chunks)} chunks indexed")
         logging.info(f"[Ariel] prefer_groq_for_think={self.prefer_groq_for_think}")
+        logging.info(f"[Ariel] fresh_context=True — no history, manifest-driven awareness")
 
-        # Prepend session context (if any) to the system prompt
+        # Prepend session context to system prompt
         if not self.is_init_mode:
             session_context = self.session_yaml.load_session_context()
             session_prompt = self.session_yaml.format_session_prompt(session_context)
             if session_prompt:
                 self.system_prompt = f"{session_prompt}\n\n{self.system_prompt}"
 
-        # Replace generic LMF tool rules with Ariel-specific write gate behavior.
-        # The generic rules say "propose and wait" which contradicts Ariel's gate-first architecture.
-        import re as _re
-        # Strip the generic "# Tool Use Rules" section and its content
-        self.system_prompt = _re.sub(
-            r"\n# Tool Use Rules\n.*?(?=\n# |\Z)",
-            "",
-            self.system_prompt,
-            count=1,
-            flags=_re.DOTALL,
-        ).strip()
-        # Append Ariel-specific write gate rules
-        self.system_prompt += (
-            "\n\n---\n"
-            "## Write Gate Rules (Ariel)\n"
-            "All vault writes are gated by the system before your response. "
-            "You never need to propose, confirm, or discuss write operations "
-            "in natural language. The gate handles operator confirmation "
-            "automatically. If the gate did not produce a proposal, no write "
-            "occurred — respond normally without mentioning writes."
+    def _build_system_with_manifest(self) -> str:
+        """Build the per-turn system prompt: core personality + manifest."""
+        self._age_awareness()
+        from lmf.orchestrator import KNOWLEDGE_DOMAINS, SHOW_METER_IN_PROMPT
+        manifest = build_manifest(
+            self.awareness, self.turn_number,
+            show_meter=SHOW_METER_IN_PROMPT,
+            knowledge_domains=KNOWLEDGE_DOMAINS,
+        )
+        return (
+            f"{self.system_prompt}\n\n{manifest}\n\n"
+            "Each turn starts fresh — only the files listed above are loaded. "
+            "If the operator asks about something not in the manifest, use the "
+            "available tools to look it up."
         )
 
     def _call_backend(self, prompt: str, timeout: int = 300, prefer_backend: str | None = None) -> str:
-        """Single backend call — does NOT append to history."""
-        from lmf.orchestrator import BACKENDS
-        from lmf.backends import BackendError, RateLimitError
-        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
+        """Single backend call with manifest-injected system prompt."""
+        system = self._build_system_with_manifest()
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
 
         ordered = BACKENDS[:]
         if prefer_backend:
@@ -88,16 +85,15 @@ class ArielOrchestrator(Orchestrator):
         logging.warning("[Ariel] All backends exhausted")
         return "[All backends exhausted]"
 
-    def _call_backend_with_history(self, user_message: str, timeout: int = 300, prefer_backend: str | None = None) -> str:
-        """Backend call with conversation history — does NOT auto-append to history."""
-        from lmf.orchestrator import BACKENDS
-        from lmf.backends import BackendError, RateLimitError
-        messages = [{"role": "system", "content": self.system_prompt}]
-        messages += self.history
-        messages.append({"role": "user", "content": user_message})
+    def _call_backend_no_history(self, user_message: str, timeout: int = 300, prefer_backend: str | None = None) -> str:
+        """Respond step backend call — no history, just current turn + manifest."""
+        system = self._build_system_with_manifest()
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_message}]
+
         ordered = BACKENDS[:]
         if prefer_backend:
             ordered = sorted(BACKENDS, key=lambda x: (0 if x[1].name == prefer_backend else 1, x[0]))
+
         for _, backend in ordered:
             if not backend.is_available:
                 continue
@@ -114,66 +110,29 @@ class ArielOrchestrator(Orchestrator):
         return "[All backends exhausted]"
 
     def _is_lightweight_turn(self, message: str) -> bool:
-        """True if message is short enough that an insight interrupt is non-disruptive."""
         return len(message.split()) < 15 and not any(
             kw in message.lower() for kw in ["build", "write", "create", "fix", "update", "add", "run"]
         )
 
-    def _handle_capture_response(self, message: str, timeout: int) -> str:
-        """Multi-turn capture flow state machine.
-
-        Step 1: detect_capture_flow() sets _capture_pending with content + target=None
-                → returns "Task, project, or inbox?"
-        Step 2: User responds with target type
-                → if content is a pronoun, asks for actual content
-                → if content is meaningful, writes directly
-        Step 3: User provides content → appends to Inbox.md, returns verification
+    def _gated_revival(self, response: str) -> str | None:
+        """Check if the model referenced a dismissed file. If so, prompt operator to revive it.
+        Returns a revival prompt string if a match is found, else None.
         """
-        pending = self._capture_pending
-        lowered = message.strip().lower().rstrip(".,! ")
-
-        # --- Step 2: User specified target type ---
-        if pending["target"] is None:
-            if lowered in ("inbox", "i"):
-                pending["target"] = "inbox"
-                if self._write_parser._is_reference_word(pending["content"]):
-                    self._capture_pending = pending
-                    return "What should I capture to inbox?"
-                content = pending["content"]
-                self._capture_pending = None
-                raw = self._dispatch_tool("append_to_file", {
-                    "file_path": "Inbox.md",
-                    "content": content + "\n",
-                })
-                return f"✓ Appended to Inbox.md"
-            elif lowered in ("task", "t"):
-                self._capture_pending = None
-                return "Task capture isn't wired yet — use a capture phrase."
-            elif lowered in ("project", "p"):
-                self._capture_pending = None
-                return "Project capture isn't wired yet — use a capture phrase."
-            else:
-                self._capture_pending = None
-                return "Didn't catch that. Message normally or use 'capture' phrases."
-
-        # --- Step 3: User provided content for inbox ---
-        if pending["target"] == "inbox":
-            content = message.strip()
-            if content:
-                self._capture_pending = None
-                raw = self._dispatch_tool("append_to_file", {
-                    "file_path": "Inbox.md",
-                    "content": content + "\n",
-                })
-                return f"✓ Appended to Inbox.md"
-            else:
-                self._capture_pending = None
-                return "Nothing to capture."
-
-        self._capture_pending = None
-        return "Capture cancelled."
+        for path in list(self.awareness["dismissed"].keys()):
+            if path in self.never_ask:
+                continue
+            # Check if path appears in response (as a reference)
+            basename = Path(path).stem
+            if basename.lower() in response.lower():
+                return (
+                    f"\n\n---\n_Ariel thinks `{path}` is relevant again. "
+                    f"Add to awareness? (yes / no / never)_"
+                )
+        return None
 
     def chat(self, user_message: str, timeout: int = 300) -> str:
+        self.turn_number += 1
+
         # === Pending Insight Confirmation ===
         pending, updates = self.memory.get_pending_insight()
         if pending:
@@ -188,7 +147,7 @@ class ArielOrchestrator(Orchestrator):
             else:
                 self.memory.pending_insight = None
                 self.memory.pending_session_updates = None
-                return "✅ Insight creation declined."
+                return "Insight creation declined."
 
         # === Pending Write Confirmation ===
         if self.pending_write:
@@ -215,21 +174,16 @@ class ArielOrchestrator(Orchestrator):
             self.pending_write = {"name": intent.tool, "args": intent.args, "proposal": proposal}
             return proposal
 
-        # === Capture Flow Detection — generic "capture X" → marlin-capture ===
+        # === Capture Flow Detection ===
         capture_content = self._write_parser.detect_capture_flow(user_message)
         if capture_content:
             self._capture_pending = {"content": capture_content, "target": None}
-            response = "Task, project, or inbox?"
-            self.history.append({"role": "user", "content": user_message})
-            self.history.append({"role": "assistant", "content": response})
-            if len(self.history) > 20:
-                self.history = self.history[-20:]
-            return response
+            return "Task, project, or inbox?"
 
-        # === 1. Sanitize & Warn ===
+        # === 1. Sanitize ===
         sanitized_input, warning_detected = self.guard.sanitize(user_message)
 
-        # === 2. Think (internal monologue) — Groq preferred (toggle via PREFER_GROQ_FOR_THINK) ===
+        # === 2. Think (internal monologue) ===
         thinking_prompt = f"""You are Ariel's internal reasoning module.
 Analyze the user's message and identify what knowledge is missing to provide a grounded, neuro‑informed response.
 If you need to look up information in the vault, specify the tool calls you would make using these exact tool names:
@@ -241,10 +195,12 @@ If you need to look up information in the vault, specify the tool calls you woul
   grep_vault("pattern")              — regex search across all files
   list_files()                       — list all vault notes
 
-The vault also contains skill definitions at System/Skills/. If the user's request
-involves a task or workflow (capturing, enriching, building, planning), use
-search_vault("skill: <topic>") or grep_vault("skill-name") to check whether a
-relevant skill exists before responding.
+The vault also contains:
+- System/Skills/ — workflow definitions for common tasks
+- Learning/ — architecture patterns and coded principles
+- Insights/ — design philosophy and self-knowledge
+
+If relevant to the user's request, use search_vault or grep_vault to check them.
 
 Output your reasoning in this format:
 
@@ -283,7 +239,6 @@ User message: {sanitized_input}"""
                             )
                         continue
 
-                    # Build args dict for _dispatch_tool (direct I/O tools)
                     args_dict = {}
                     if tool_name == "read_section" and len(tool_args) >= 2:
                         args_dict = {"file_path": tool_args[0], "heading": tool_args[1]}
@@ -302,7 +257,6 @@ User message: {sanitized_input}"""
                     result_json = self._dispatch_tool(tool_name, args_dict)
                     result = json.loads(result_json)
 
-                    # Extract useful content based on result shape
                     if isinstance(result, dict):
                         if "results" in result and isinstance(result["results"], list):
                             for res in result["results"]:
@@ -333,13 +287,11 @@ User message: {sanitized_input}"""
                     logging.error(f"Tool {tool_name} failed: {e}")
                     vault_context_parts.append(f"[Error calling {tool_name}: {e}]")
 
-            # Quality check: did this round produce any non-error content?
             new_parts = vault_context_parts[before_len:]
             useful = [p for p in new_parts if not p.startswith("[Error")]
             if useful:
-                break  # Got useful results — done
+                break
 
-            # Thin/no results — ask Think to try a different approach
             if rounds < MAX_RETRIEVAL_ROUNDS:
                 retry_prompt = f"""Your previous retrieval returned no useful results.
         Original query: {sanitized_input}
@@ -351,35 +303,49 @@ User message: {sanitized_input}"""
                     break
         vault_context = "\n\n---\n\n".join(vault_context_parts) if vault_context_parts else ""
 
-        # === 4. Respond (grounded) ===
+        # === 4. Respond (grounded — no history) ===
         grounded_input = f"{sanitized_input}\n\n[Relevant Vault Context]:\n{vault_context}" if vault_context else sanitized_input
         grounded_input += (
             "\n\n[Gate note: No write was performed. "
             "Do NOT mention or imply any write or capture in your response.]"
         )
-        response = self._call_backend_with_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
+        response = self._call_backend_no_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
 
         # === 5. Post-process warnings ===
         if warning_detected:
             response = f"⚠️ **Potential Injection Detected**\n\n{response}"
 
-        # === 6. Manually append clean history ===
-        self.history.append({"role": "user", "content": user_message})
-        self.history.append({"role": "assistant", "content": response})
-        # Trim to sliding window (10 turns = 20 messages)
-        max_messages = 20
-        if len(self.history) > max_messages:
-            self.history = self.history[-max_messages:]
+        # === 6. Session summary (compressed turn memory for next turn) ===
+        from lmf.orchestrator import SESSION_MEMORY_TURNS
+        summary_prompt = (
+            "Compress this turn into one brief line (max 20 words). "
+            "Focus on what was asked and what was found:\n"
+            f"User asked: {sanitized_input[:200]}\n"
+            f"Response: {response[:200]}"
+        )
+        summary = self._call_backend(summary_prompt, timeout=timeout)
+        self.session_memory.append(summary.strip())
+        if len(self.session_memory) > SESSION_MEMORY_TURNS:
+            self.session_memory = self.session_memory[-SESSION_MEMORY_TURNS:]
 
-        # === 7. Summarization / Ask & Confirm (lightweight turns only) ===
-        if self.memory.needs_summarization(self.history) and self._is_lightweight_turn(user_message):
+        # === 7. Gated revival — check if model referenced a dismissed file ===
+        revival_prompt = self._gated_revival(response)
+        if revival_prompt:
+            response += revival_prompt
+
+        # === 8. Age awareness (move old active→stale, evict old stale) ===
+        self._age_awareness()
+        self._log_manifest_snapshot()
+
+        # === 9. Summarization (lightweight turns only) ===
+        if self.memory.needs_summarization(self.awareness) and self._is_lightweight_turn(user_message):
             if not self.memory.pending_insight:
-                recent = self.history[-self.memory.get_pruning_index(self.history):]
-                user_msgs = [m.get('content', '') for m in recent if m.get('role') == 'user']
-                snippet = "\n---\n".join(user_msgs)
-                summarization_prompt = f"""You are summarizing a conversation for the operator's executive brain. Extract the *key insights*, patterns, and actionable takeaways from the following user messages. Limit the summary to ~150 words and present it as a concise bullet list.
+                pinned_paths = list(self.awareness["pinned"].keys())
+                active_paths = list(self.awareness["active"].keys())
+                snippet = f"Pinned: {pinned_paths}\nActive: {active_paths}"
+                summarization_prompt = f"""You are summarizing a conversation for the operator's executive brain. Extract the *key insights*, patterns, and actionable takeaways from the following context. Limit the summary to ~150 words and present it as a concise bullet list.
 
-User messages:\n{snippet}\n"""
+Current awareness:\n{snippet}\n"""
                 insight_text = self._call_backend(summarization_prompt, timeout)
                 self.memory.set_pending_insight(insight_text.strip(), session_topic="General")
                 return "I have extracted a key insight from our recent conversation. Would you like me to create an Insight note for it? (yes/no)"
