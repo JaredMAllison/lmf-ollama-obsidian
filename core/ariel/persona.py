@@ -234,10 +234,10 @@ class ArielOrchestrator(Orchestrator):
                 tool_calls = []
                 if result.tool_calls:
                     for tc in result.tool_calls:
+                        fn = tc["function"]
                         tool_calls.append({
-                            "name": tc.function.name,
-                            "args": json.loads(tc.function.arguments),
-                            "id": tc.id,
+                            "name": fn["name"],
+                            "args": fn["arguments"],
                         })
                 return result.content or "", tool_calls
             except RateLimitError as e:
