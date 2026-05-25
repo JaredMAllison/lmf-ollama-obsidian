@@ -363,8 +363,8 @@ class ArielOrchestrator(Orchestrator):
 
         # === 2. Think-Read (read tools only — model reads what it needs) ===
         think_read_prompt = f"""The user wants to read or update vault content.
-Call read tools to find the relevant information.
-If a file path is given, call read_lines directly on that file.
+If the exact file path is given, call read_lines directly for line-numbered output.
+Otherwise search_vault first, then call read_lines on the matching file.
 
 User message: {sanitized_input}"""
         thinking_response, read_calls = self._call_backend_think(think_read_prompt, timeout, _THINK_READ_TOOL_DEFS)
@@ -464,8 +464,9 @@ User message: {sanitized_input}"""
         write_calls = []
         if vault_context and any(kw in sanitized_input.lower() for kw in _WRITE_KEYWORDS):
             think_write_prompt = f"""The user wants to update vault content.
-Using the file content below, call the write tool to make the change.
-Use exact content and real line numbers from the file shown.
+The file content below shows current line numbers (1-indexed).
+If a value already exists, REPLACE it at its exact line number.
+Do NOT add a new line — replace the existing one.
 
 --- File content ---
 {vault_context[:3000]}
