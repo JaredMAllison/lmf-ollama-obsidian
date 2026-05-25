@@ -352,10 +352,10 @@ class ArielOrchestrator(Orchestrator):
         sanitized_input, warning_detected = self.guard.sanitize(user_message)
 
         # === 2. Think (internal monologue with structured tools) ===
-        thinking_prompt = f"""You are Ariel's internal reasoning module.
-Think about what the user needs — read information, or create/update content.
-If a write is needed, read the file FIRST to see its content, then propose the write.
-Use the available tools to look up information, then propose writes if needed.
+        thinking_prompt = f"""The user wants to read information or update content.
+You MUST call the available tools to fulfill the request.
+If a file path is given, call read_lines first.
+Then call the appropriate write tool. Do not just search — read and write directly.
 
 User message: {sanitized_input}"""
         thinking_response, tool_calls = self._call_backend_think(thinking_prompt, timeout)
@@ -489,8 +489,9 @@ User message: {sanitized_input}"""
         # === 7. Respond (grounded — no history) ===
         grounded_input = f"{sanitized_input}\n\n[Relevant Vault Context]:\n{vault_context}" if vault_context else sanitized_input
         grounded_input += (
-            "\n\n[Gate note: No write was performed. "
-            "Do NOT mention or imply any write or capture in your response.]"
+            "\n\nCRITICAL: You did NOT write anything. No files were modified. "
+            "Do NOT claim or imply that any write, update, capture, or edit was performed. "
+            "If the user asks what was updated, say no changes were made."
         )
         response = self._call_backend_no_history(grounded_input, timeout, prefer_backend="groq" if self.prefer_groq_for_think else None)
 
