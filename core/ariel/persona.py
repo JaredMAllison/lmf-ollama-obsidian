@@ -33,7 +33,7 @@ class ArielOrchestrator(Orchestrator):
         self._capture_pending = None
 
         # Groq toggle
-        raw = os.environ.get("PREFER_GROQ_FOR_THINK", "true")
+        raw = os.environ.get("PREFER_GROQ_FOR_THINK", "false")
         self.prefer_groq_for_think = raw.strip().lower() in ("true", "1", "yes")
         logging.info(f"[Ariel] kb_core initialized — {len(self.kb.chunks)} chunks indexed")
         logging.info(f"[Ariel] prefer_groq_for_think={self.prefer_groq_for_think}")
