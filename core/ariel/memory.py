@@ -13,7 +13,7 @@ class ArielMemory:
     def __init__(self, vault_path: str, loom_url: str = "http://knowledge-loom:8888"):
         self.vault = Path(vault_path)
         self.loom_url = loom_url
-        self.summaries_dir = self.vault / "Vault/ContextSummaries"
+        self.summaries_dir = self.vault / "System/Vault/ContextSummaries"
         self.summaries_dir.mkdir(parents=True, exist_ok=True)
         self.pending_insight = None
         self.pending_session_updates = None
